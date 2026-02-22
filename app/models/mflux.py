@@ -10,7 +10,7 @@ from mflux.models.flux.variants.txt2img.flux import Flux1
 from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 from mflux.models.flux.variants.kontext.flux_kontext import Flux1Kontext
 from mflux.models.qwen.variants.edit.qwen_image_edit import QwenImageEdit
-from mflux.models.z_image.variants.turbo import ZImageTurbo
+from mflux.models.z_image.variants.z_image import ZImage as ZImageTurbo
 from mflux.models.fibo.variants.txt2img.fibo import FIBO
 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
 from mflux.models.flux2.variants.edit.flux2_klein_edit import Flux2KleinEdit
@@ -415,6 +415,7 @@ class Flux2KleinModel(BaseImageModel):
                 model_path=self.model_path,
                 lora_paths=self.config.lora_paths,
                 lora_scales=self.config.lora_scales,
+                model_config=self.config.model_config,
             )
             self._is_loaded = True
             self.logger.info("Flux2 Klein model loaded successfully")
@@ -446,6 +447,7 @@ class Flux2KleinEditModel(Flux2KleinModel):
                 model_path=self.model_path,
                 lora_paths=self.config.lora_paths,
                 lora_scales=self.config.lora_scales,
+                model_config=self.config.model_config,
             )
             self._is_loaded = True
             self.logger.info("Flux2 Klein Edit model loaded successfully")

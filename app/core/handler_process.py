@@ -395,17 +395,20 @@ class HandlerProcessProxy:
         self._pending["__ready__"] = ready_queue
 
         try:
-            response = await asyncio.wait_for(ready_queue.get(), timeout=300)
+            response = await asyncio.wait_for(ready_queue.get(), timeout=600)
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"Handler process for '{self.model_id}' "
-                "did not become ready within 300 s"
+                "did not become ready within 600 s"
             )
         finally:
             self._pending.pop("__ready__", None)
 
         if not response.get("success"):
             error_msg = response.get("error", "unknown error")
+            tb = response.get("traceback", "")
+            if tb:
+                logger.error(f"Handler process traceback for '{self.model_id}':\n{tb}")
             raise RuntimeError(
                 f"Handler process for '{self.model_id}' "
                 f"failed to initialize: {error_msg}"
