@@ -31,7 +31,7 @@ class MLXLMHandler:
 
     handler_type: str = "lm"
 
-    def __init__(self, model_path: str, draft_model_path: str | None = None, num_draft_tokens: int = 2, context_length: int | None = None, max_concurrency: int = 1, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, message_converter: str = None, trust_remote_code: bool = False, chat_template_file: str = None, debug: bool = False, prompt_cache_size: int = 10, default_temperature: float | None = None, default_repetition_penalty: float | None = None):
+    def __init__(self, model_path: str, draft_model_path: str | None = None, num_draft_tokens: int = 2, context_length: int | None = None, max_concurrency: int = 1, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, message_converter: str = None, trust_remote_code: bool = False, chat_template_file: str = None, debug: bool = False, prompt_cache_size: int = 10, default_temperature: float | None = None, default_repetition_penalty: float | None = None, enable_thinking: bool = True):
         """
         Initialize the handler with the specified model path.
 
@@ -80,6 +80,7 @@ class MLXLMHandler:
         # Per-model sampling defaults
         self.default_temperature = default_temperature
         self.default_repetition_penalty = default_repetition_penalty
+        self.enable_thinking = enable_thinking
         # Store parser configuration
         self.enable_auto_tool_choice = enable_auto_tool_choice
         # Debug mode
@@ -624,6 +625,11 @@ class MLXLMHandler:
                 request_dict["temperature"] = self.default_temperature
             if request_dict.get("repetition_penalty") is None and self.default_repetition_penalty is not None:
                 request_dict["repetition_penalty"] = self.default_repetition_penalty
+
+            # Apply per-model enable_thinking default when request does not specify it
+            if chat_template_kwargs.get("enable_thinking") is None:
+                chat_template_kwargs["enable_thinking"] = self.enable_thinking
+            request_dict["chat_template_kwargs"] = chat_template_kwargs
 
             return chat_messages, request_dict
         

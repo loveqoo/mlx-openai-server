@@ -366,6 +366,7 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         num_draft_tokens=model_cfg.num_draft_tokens,
         default_temperature=model_cfg.default_temperature,
         default_repetition_penalty=model_cfg.default_repetition_penalty,
+        enable_thinking=model_cfg.enable_thinking,
     )
 
 

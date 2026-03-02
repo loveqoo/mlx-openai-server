@@ -217,7 +217,7 @@ class Message(OpenAIBaseModel):
 class ChatTemplateKwargs(OpenAIBaseModel):
     """Represents the arguments for a chat template."""
 
-    enable_thinking: bool = Field(default=True, description="Whether to enable thinking.")
+    enable_thinking: bool | None = Field(default=None, description="Whether to enable thinking. If None, the per-model default is used.")
     reasoning_effort: Literal["low", "medium", "high"] = Field(
         default="medium", description="The reasoning effort level."
     )

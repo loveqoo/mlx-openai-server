@@ -19,6 +19,10 @@ class Qwen3MoEReasoningParser(HermesReasoningParser):
         """Initialize the Qwen3 MoE reasoning parser with appropriate regex patterns."""
         super().__init__(reasoning_open=reasoning_open, reasoning_close=reasoning_close)
 
+    def respects_enable_thinking(self) -> bool:
+        """Qwen3 MoE parser should be disabled when enable_thinking=False."""
+        return True
+
     def needs_redacted_reasoning_prefix(self) -> bool:
         """Check if the reasoning parser needs a redacted reasoning prefix.
         

@@ -186,6 +186,7 @@ class ModelEntryConfig:
     draft_model_path: str | None = None
     default_temperature: float | None = None
     default_repetition_penalty: float | None = None
+    enable_thinking: bool = True
     num_draft_tokens: int = 2
 
     def __post_init__(self) -> None:
