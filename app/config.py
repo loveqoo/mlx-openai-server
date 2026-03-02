@@ -184,6 +184,8 @@ class ModelEntryConfig:
     debug: bool = False
     prompt_cache_size: int = 10
     draft_model_path: str | None = None
+    default_temperature: float | None = None
+    default_repetition_penalty: float | None = None
     num_draft_tokens: int = 2
 
     def __post_init__(self) -> None:

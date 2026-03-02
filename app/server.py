@@ -364,6 +364,8 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         prompt_cache_size=model_cfg.prompt_cache_size,
         draft_model_path=model_cfg.draft_model_path,
         num_draft_tokens=model_cfg.num_draft_tokens,
+        default_temperature=model_cfg.default_temperature,
+        default_repetition_penalty=model_cfg.default_repetition_penalty,
     )
 
 

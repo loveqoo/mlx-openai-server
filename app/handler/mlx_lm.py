@@ -31,7 +31,7 @@ class MLXLMHandler:
 
     handler_type: str = "lm"
 
-    def __init__(self, model_path: str, draft_model_path: str | None = None, num_draft_tokens: int = 2, context_length: int | None = None, max_concurrency: int = 1, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, message_converter: str = None, trust_remote_code: bool = False, chat_template_file: str = None, debug: bool = False, prompt_cache_size: int = 10):
+    def __init__(self, model_path: str, draft_model_path: str | None = None, num_draft_tokens: int = 2, context_length: int | None = None, max_concurrency: int = 1, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, message_converter: str = None, trust_remote_code: bool = False, chat_template_file: str = None, debug: bool = False, prompt_cache_size: int = 10, default_temperature: float | None = None, default_repetition_penalty: float | None = None):
         """
         Initialize the handler with the specified model path.
 
@@ -77,10 +77,13 @@ class MLXLMHandler:
         self.model_created = int(time.time())  # Store creation time when model is loaded
         self.model_type = self.model.get_model_type()
         
+        # Per-model sampling defaults
+        self.default_temperature = default_temperature
+        self.default_repetition_penalty = default_repetition_penalty
         # Store parser configuration
         self.enable_auto_tool_choice = enable_auto_tool_choice
         # Debug mode
-        self.debug = debug   
+        self.debug = debug
         self.reasoning_parser_name = reasoning_parser
         self.tool_parser_name = tool_call_parser
         self.prompt_cache = LRUPromptCache(max_size=prompt_cache_size)
@@ -615,6 +618,13 @@ class MLXLMHandler:
             
             # Add all non-system messages after the merged system message
             chat_messages.extend(non_system_messages)
+
+            # Apply per-model sampling defaults when request does not specify a value
+            if request_dict.get("temperature") is None and self.default_temperature is not None:
+                request_dict["temperature"] = self.default_temperature
+            if request_dict.get("repetition_penalty") is None and self.default_repetition_penalty is not None:
+                request_dict["repetition_penalty"] = self.default_repetition_penalty
+
             return chat_messages, request_dict
         
         except Exception as e:
