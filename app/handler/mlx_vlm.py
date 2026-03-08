@@ -1,35 +1,39 @@
 import asyncio
 import base64
 import gc
-import time
 from http import HTTPStatus
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any
 
-import mlx.core as mx
-import torch
 from fastapi import HTTPException
 from loguru import logger
+import mlx.core as mx
 from mlx_vlm.video_generate import process_vision_info
+import torch
 
 from ..core import AudioProcessor, ImageProcessor, InferenceWorker, VideoProcessor
 from ..message_converters import MessageConverterManager
 from ..models.mlx_vlm import MLX_VLM
-from ..parsers import ParserManager
+from ..parsers import ParserManager, ReasoningParserState, ToolParserState
 from ..schemas.openai import (
     ChatCompletionContentPart,
     ChatCompletionContentPartImage,
     ChatCompletionContentPartInputAudio,
     ChatCompletionContentPartVideo,
     ChatCompletionRequest,
-    UsageInfo
+    UsageInfo,
 )
 from ..utils.debug_logging import (
+    log_debug_model_dispatch,
+    log_debug_parser_event,
     log_debug_prompt,
     log_debug_raw_text_response,
     log_debug_request,
     log_debug_stats,
+    log_debug_tool_call_emission,
 )
 from ..utils.errors import create_error_response
+
 
 class MLXVLMHandler:
     """
@@ -39,10 +43,24 @@ class MLXVLMHandler:
 
     handler_type: str = "multimodal"
 
-    def __init__(self, model_path: str, context_length: int | None = None, max_workers: int = 4, max_concurrency: int = 1, disable_auto_resize: bool = False, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, message_converter: str = None, trust_remote_code: bool = False, chat_template_file: str = None, debug: bool = False):
+    def __init__(
+        self,
+        model_path: str,
+        context_length: int | None = None,
+        max_workers: int = 4,
+        max_concurrency: int = 1,
+        disable_auto_resize: bool = False,
+        enable_auto_tool_choice: bool = False,
+        tool_call_parser: str = None,
+        reasoning_parser: str = None,
+        message_converter: str = None,
+        trust_remote_code: bool = False,
+        chat_template_file: str = None,
+        debug: bool = False,
+    ):
         """
         Initialize the handler with the specified model path.
-        
+
         Args:
             model_path (str): Path to the model directory.
             context_length (int | None): Maximum context length for the model. If None, uses model default.
@@ -56,46 +74,57 @@ class MLXVLMHandler:
             chat_template_file (str): Path to a custom chat template file.
         """
         self.model_path = model_path
-        self.model = MLX_VLM(model_path, context_length=context_length, trust_remote_code=trust_remote_code, chat_template_file=chat_template_file)
+        self.model = MLX_VLM(
+            model_path,
+            context_length=context_length,
+            trust_remote_code=trust_remote_code,
+            chat_template_file=chat_template_file,
+        )
         self.image_processor = ImageProcessor(max_workers)
         self.audio_processor = AudioProcessor(max_workers)
         self.video_processor = VideoProcessor(max_workers)
         self.disable_auto_resize = disable_auto_resize
         self.model_created = int(time.time())  # Store creation time when model is loaded
         self.model_type = self.model.get_model_type()
-        
+
         # Store parser configuration
         self.enable_auto_tool_choice = enable_auto_tool_choice
         self.reasoning_parser_name = reasoning_parser
         self.tool_parser_name = tool_call_parser
-        self.message_converter = MessageConverterManager.create_converter(message_converter)
+        self.message_converter = MessageConverterManager.create_converter(
+            converter_name=message_converter,
+            tool_parser_name=tool_call_parser,
+            reasoning_parser_name=reasoning_parser,
+        )
         # Debug mode
         self.debug = debug
 
         # Dedicated inference thread — keeps the event loop free during
         # blocking MLX model computation.
         self.inference_worker = InferenceWorker()
-        
+
         logger.info(f"Initialized MLXHandler with model path: {model_path}")
         if disable_auto_resize:
             logger.info("Auto-resize is disabled for image processing")
 
-    async def get_models(self) -> List[Dict[str, Any]]:
+    async def get_models(self) -> list[dict[str, Any]]:
         """
         Get list of available models with their metadata.
         """
         try:
-            return [{
-                "id": self.model_path,
-                "object": "model",
-                "created": self.model_created,
-                "owned_by": "local"
-            }]
+            return [
+                {
+                    "id": self.model_path,
+                    "object": "model",
+                    "created": self.model_created,
+                    "owned_by": "local",
+                }
+            ]
         except Exception as e:
-            logger.error(f"Error getting models: {str(e)}")
+            logger.error(f"Error getting models: {e!s}")
             return []
-    
-    async def initialize(self, queue_config: Optional[Dict[str, Any]] = None) -> None:
+
+    async def initialize(self, queue_config: dict[str, Any] | None = None) -> None:
         """Initialize the handler and start the inference worker.
 
         Parameters
@@ -119,39 +148,39 @@ class MLXVLMHandler:
     async def generate_multimodal_stream(self, request: ChatCompletionRequest):
         """
         Generate a streaming response for multimodal chat completion requests.
-        
+
         Args:
             request: ChatCompletionRequest object containing the messages.
-        
+
         Returns:
             AsyncGenerator: Yields response chunks.
         """
-        
+
         try:
             request_dict = await self._prepare_multimodal_request(request)
-            
+
             # Extract messages, images, videos, audios
             messages = request_dict["messages"]
             chat_template_kwargs = request_dict["chat_template_kwargs"]
-            
+
             # Create input prompt
             input_prompt = self.model.create_input_prompt(messages, chat_template_kwargs)
-            
+
             if self.debug:
                 log_debug_prompt(input_prompt)
-            
+
             # Process vision info and create inputs
             image_inputs, video_inputs = process_vision_info(messages)
             vision_inputs = self.model.create_inputs(input_prompt, image_inputs, video_inputs)
-                    
+
             # Convert torch tensors to mlx arrays
             for key, value in vision_inputs.items():
                 if isinstance(value, torch.Tensor):
                     vision_inputs[key] = mx.array(value)
-            
+
             if self.debug:
                 log_debug_request(request_dict)
-    
+
             model_params = {
                 # sampling params
                 "seed": request_dict.get("seed"),
@@ -166,11 +195,17 @@ class MLXVLMHandler:
                 "vision_inputs": vision_inputs,
             }
 
+            if self.debug:
+                log_debug_model_dispatch(
+                    "mlx_vlm.generate_multimodal_stream.submit_stream",
+                    {"prompt": input_prompt, "stream": True, **model_params},
+                )
+
             response_generator = self.inference_worker.submit_stream(
                 self.model,
                 prompt=input_prompt,
                 stream=True,
-                verbose = self.debug,
+                verbose=self.debug,
                 **model_params,
             )
 
@@ -197,6 +232,7 @@ class MLXVLMHandler:
             final_chunk = None
             is_first_chunk = True
             raw_text = ""  # only use for debugging
+            chunk_index = 0
 
             # Handle unified parser streaming
             if parsers_result.is_unified:
@@ -204,17 +240,41 @@ class MLXVLMHandler:
                 async for chunk in response_generator:
                     if chunk is None:
                         continue
+                    chunk_index += 1
                     final_chunk = chunk
                     text = chunk.text
                     raw_text += text
-                    
+
+                    if self.debug:
+                        log_debug_parser_event(
+                            component="mlx_vlm.stream.unified",
+                            chunk_index=chunk_index,
+                            phase="before-parse",
+                            parser=unified_parser,
+                            text=text,
+                        )
                     parsed_result, is_complete = unified_parser.parse_streaming(text)
+                    if self.debug:
+                        log_debug_parser_event(
+                            component="mlx_vlm.stream.unified",
+                            chunk_index=chunk_index,
+                            phase="after-parse",
+                            parser=unified_parser,
+                            parsed_content=parsed_result,
+                            is_complete=is_complete,
+                        )
                     if parsed_result:
                         # Unified parser returns dict with reasoning_content, tool_calls, content
                         if parsed_result.get("reasoning_content"):
                             yield {"reasoning_content": parsed_result["reasoning_content"]}
                         if parsed_result.get("tool_calls"):
                             for tool_call in parsed_result["tool_calls"]:
+                                if self.debug:
+                                    log_debug_tool_call_emission(
+                                        component="mlx_vlm.stream.unified",
+                                        chunk_index=chunk_index,
+                                        tool_call=tool_call,
+                                    )
                                 yield tool_call
                         if parsed_result.get("content"):
                             yield parsed_result["content"]
@@ -223,47 +283,152 @@ class MLXVLMHandler:
                 # Handle separate parsers streaming
                 reasoning_parser = parsers_result.reasoning_parser
                 tool_parser = parsers_result.tool_parser
-                
+
                 async for chunk in response_generator:
                     if chunk is None:
                         continue
+                    chunk_index += 1
                     final_chunk = chunk
                     text = chunk.text
                     raw_text += text
                     if is_first_chunk:
-                        if reasoning_parser and hasattr(reasoning_parser, 'needs_redacted_reasoning_prefix'):
+                        if reasoning_parser and hasattr(
+                            reasoning_parser, "needs_redacted_reasoning_prefix"
+                        ):
                             if reasoning_parser.needs_redacted_reasoning_prefix():
                                 text = reasoning_parser.get_reasoning_open() + text
                         is_first_chunk = False
-                    if reasoning_parser:
-                        parsed_content, is_complete = reasoning_parser.extract_reasoning_streaming(text)
-                        
-                        if parsed_content:
-                            after_reasoning_close_content = parsed_content.get("after_reasoning_close_content")
-                            yield parsed_content
-                        if is_complete:
-                            reasoning_parser = None
-                        if after_reasoning_close_content:
-                            text = after_reasoning_close_content
-                            after_reasoning_close_content = None
-                        else:
-                            continue
-                    if tool_parser:
-                        parsed_content, is_complete = tool_parser.extract_tool_calls_streaming(text)
-                        if parsed_content:
-                            content = parsed_content.get("content")
-                            if content:
-                                yield content
-                            tool_calls = parsed_content.get("tool_calls")
-                            if tool_calls:
-                                for tool_call in tool_calls:
-                                    yield tool_call
-                        continue
+                    pending_texts = [text]
+                    while pending_texts:
+                        text = pending_texts.pop(0)
 
-                    yield text
+                        # If a tool tag opened in a previous chunk, finish tool parsing first.
+                        if tool_parser and tool_parser.state != ToolParserState.NORMAL:
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.tool",
+                                    chunk_index=chunk_index,
+                                    phase="before-parse",
+                                    parser=tool_parser,
+                                    text=text,
+                                )
+                            parsed_content, is_complete = tool_parser.extract_tool_calls_streaming(
+                                text
+                            )
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.tool",
+                                    chunk_index=chunk_index,
+                                    phase="after-parse",
+                                    parser=tool_parser,
+                                    parsed_content=parsed_content,
+                                    is_complete=is_complete,
+                                )
+                            if parsed_content:
+                                tool_calls = parsed_content.get("tool_calls")
+                                if tool_calls:
+                                    for tool_call in tool_calls:
+                                        if self.debug:
+                                            log_debug_tool_call_emission(
+                                                component="mlx_vlm.stream.tool",
+                                                chunk_index=chunk_index,
+                                                tool_call=tool_call,
+                                            )
+                                        yield tool_call
+                                content = parsed_content.get("content")
+                                if isinstance(content, str) and content:
+                                    if (
+                                        reasoning_parser
+                                        and reasoning_parser.state
+                                        == ReasoningParserState.FOUND_PREFIX
+                                    ):
+                                        pending_texts.insert(0, content)
+                                    else:
+                                        yield content
+                            continue
+
+                        if reasoning_parser:
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.reasoning",
+                                    chunk_index=chunk_index,
+                                    phase="before-parse",
+                                    parser=reasoning_parser,
+                                    text=text,
+                                )
+                            parsed_content, is_complete = (
+                                reasoning_parser.extract_reasoning_streaming(text)
+                            )
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.reasoning",
+                                    chunk_index=chunk_index,
+                                    phase="after-parse",
+                                    parser=reasoning_parser,
+                                    parsed_content=parsed_content,
+                                    is_complete=is_complete,
+                                )
+                            if parsed_content:
+                                after_reasoning_close_content = parsed_content.get(
+                                    "after_reasoning_close_content"
+                                )
+                                yield parsed_content
+                            if is_complete:
+                                reasoning_parser = None
+                            if after_reasoning_close_content:
+                                text = after_reasoning_close_content
+                                after_reasoning_close_content = None
+                            else:
+                                continue
+
+                        if tool_parser:
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.tool",
+                                    chunk_index=chunk_index,
+                                    phase="before-parse",
+                                    parser=tool_parser,
+                                    text=text,
+                                )
+                            parsed_content, is_complete = tool_parser.extract_tool_calls_streaming(
+                                text
+                            )
+                            if self.debug:
+                                log_debug_parser_event(
+                                    component="mlx_vlm.stream.tool",
+                                    chunk_index=chunk_index,
+                                    phase="after-parse",
+                                    parser=tool_parser,
+                                    parsed_content=parsed_content,
+                                    is_complete=is_complete,
+                                )
+                            if parsed_content:
+                                tool_calls = parsed_content.get("tool_calls")
+                                if tool_calls:
+                                    for tool_call in tool_calls:
+                                        if self.debug:
+                                            log_debug_tool_call_emission(
+                                                component="mlx_vlm.stream.tool",
+                                                chunk_index=chunk_index,
+                                                tool_call=tool_call,
+                                            )
+                                        yield tool_call
+                                content = parsed_content.get("content")
+                                if isinstance(content, str) and content:
+                                    if (
+                                        reasoning_parser
+                                        and reasoning_parser.state
+                                        == ReasoningParserState.FOUND_PREFIX
+                                    ):
+                                        pending_texts.insert(0, content)
+                                    else:
+                                        yield content
+                            continue
+
+                        yield text
 
             total_tokens = final_chunk.prompt_tokens + final_chunk.generation_tokens
-            
+
             if self.debug:
                 log_debug_raw_text_response(raw_text)
                 log_debug_stats(
@@ -271,55 +436,63 @@ class MLXVLMHandler:
                     final_chunk.generation_tokens,
                     total_tokens,
                     final_chunk.generation_tps,
-                    final_chunk.peak_memory
+                    final_chunk.peak_memory,
                 )
 
             yield {
                 "__usage__": UsageInfo(
                     prompt_tokens=final_chunk.prompt_tokens,
                     completion_tokens=final_chunk.generation_tokens,
-                    total_tokens=total_tokens
+                    total_tokens=total_tokens,
                 )
             }
-        
+
         except asyncio.QueueFull:
             logger.error("Too many requests. Service is at capacity.")
-            content = create_error_response("Too many requests. Service is at capacity.", "rate_limit_exceeded", HTTPStatus.TOO_MANY_REQUESTS)
+            content = create_error_response(
+                "Too many requests. Service is at capacity.",
+                "rate_limit_exceeded",
+                HTTPStatus.TOO_MANY_REQUESTS,
+            )
             raise HTTPException(status_code=429, detail=content)
 
         except Exception as e:
-            logger.error(f"Error in multimodal stream generation: {str(e)}")
-            content = create_error_response(f"Failed to generate multimodal stream: {str(e)}", "server_error", HTTPStatus.INTERNAL_SERVER_ERROR)
+            logger.error(f"Error in multimodal stream generation: {e!s}")
+            content = create_error_response(
+                f"Failed to generate multimodal stream: {e!s}",
+                "server_error",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
             raise HTTPException(status_code=500, detail=content)
 
     async def generate_multimodal_response(self, request: ChatCompletionRequest):
         """
         Generate a complete response for multimodal chat completion requests.
         Uses the request queue for handling concurrent requests.
-        
+
         Args:
             request: ChatCompletionRequest object containing the messages.
-        
+
         Returns:
             str: Complete response.
         """
         try:
             request_dict = await self._prepare_multimodal_request(request)
-            
+
             # Extract messages, images, videos, audios
             messages = request_dict["messages"]
             chat_template_kwargs = request_dict["chat_template_kwargs"]
-            
+
             # Create input prompt
             input_prompt = self.model.create_input_prompt(messages, chat_template_kwargs)
-            
+
             if self.debug:
                 log_debug_prompt(input_prompt)
-            
+
             # Process vision info and create inputs
             image_inputs, video_inputs = process_vision_info(messages)
             vision_inputs = self.model.create_inputs(input_prompt, image_inputs, video_inputs)
-            
+
             # Convert torch tensors to mlx arrays
             for key, value in vision_inputs.items():
                 if isinstance(value, torch.Tensor):
@@ -343,11 +516,17 @@ class MLXVLMHandler:
                 "vision_inputs": vision_inputs,
             }
 
+            if self.debug:
+                log_debug_model_dispatch(
+                    "mlx_vlm.generate_multimodal_response.submit",
+                    {"prompt": input_prompt, "stream": False, **model_params},
+                )
+
             response = await self.inference_worker.submit(
                 self.model,
                 prompt=input_prompt,
                 stream=False,
-                verbose = self.debug,
+                verbose=self.debug,
                 **model_params,
             )
 
@@ -371,17 +550,23 @@ class MLXVLMHandler:
                 parsers_result.reasoning_parser = None
                 parsers_result.tool_parser = None
 
-            parsed_response = {
-                "reasoning_content": None,
-                "tool_calls": None,
-                "content": None
-            }
+            parsed_response = {"reasoning_content": None, "tool_calls": None, "content": None}
             response_text = response.text
 
             # Handle unified parser
             if parsers_result.is_unified:
                 unified_parser = parsers_result.unified_parser
                 parsed_result = unified_parser.parse(response_text)
+                if self.debug:
+                    log_debug_parser_event(
+                        component="mlx_vlm.nonstream.unified",
+                        chunk_index=0,
+                        phase="parse",
+                        parser=unified_parser,
+                        text=response_text,
+                        parsed_content=parsed_result,
+                        is_complete=True,
+                    )
                 if parsed_result:
                     parsed_response["reasoning_content"] = parsed_result.get("reasoning_content")
                     parsed_response["tool_calls"] = parsed_result.get("tool_calls")
@@ -396,6 +581,16 @@ class MLXVLMHandler:
 
                 if reasoning_parser:
                     parsed_content = reasoning_parser.extract_reasoning(response_text)
+                    if self.debug:
+                        log_debug_parser_event(
+                            component="mlx_vlm.nonstream.reasoning",
+                            chunk_index=0,
+                            phase="parse",
+                            parser=reasoning_parser,
+                            text=response_text,
+                            parsed_content=parsed_content,
+                            is_complete=True,
+                        )
                     parsed_response["reasoning_content"] = parsed_content.get("reasoning_content")
                     parsed_response["content"] = parsed_content.get("content")
                     response_text = parsed_content.get("after_reasoning_close_content")
@@ -403,12 +598,31 @@ class MLXVLMHandler:
                 if response_text:
                     if tool_parser:
                         parsed_content = tool_parser.extract_tool_calls(response_text)
+                        if self.debug:
+                            log_debug_parser_event(
+                                component="mlx_vlm.nonstream.tool",
+                                chunk_index=0,
+                                phase="parse",
+                                parser=tool_parser,
+                                text=response_text,
+                                parsed_content=parsed_content,
+                                is_complete=True,
+                            )
                         parsed_response["tool_calls"] = parsed_content.get("tool_calls")
                         parsed_response["content"] = parsed_content.get("content")
             else:
                 parsed_response["content"] = response_text
 
             total_tokens = response.prompt_tokens + response.generation_tokens
+
+            if self.debug and isinstance(parsed_response.get("tool_calls"), list):
+                for tool_call in parsed_response["tool_calls"]:
+                    if isinstance(tool_call, dict):
+                        log_debug_tool_call_emission(
+                            component="mlx_vlm.nonstream.tool",
+                            chunk_index=0,
+                            tool_call=tool_call,
+                        )
 
             if self.debug:
                 log_debug_raw_text_response(response.text)
@@ -417,38 +631,45 @@ class MLXVLMHandler:
                     response.generation_tokens,
                     total_tokens,
                     response.generation_tps,
-                    response.peak_memory
+                    response.peak_memory,
                 )
-            
+
             usage = UsageInfo(
                 prompt_tokens=response.prompt_tokens,
                 completion_tokens=response.generation_tokens,
-                total_tokens=total_tokens
+                total_tokens=total_tokens,
             )
-            
+
             return {"response": parsed_response, "usage": usage}
-                        
+
         except asyncio.QueueFull:
             logger.error("Too many requests. Service is at capacity.")
-            content = create_error_response("Too many requests. Service is at capacity.", "rate_limit_exceeded", HTTPStatus.TOO_MANY_REQUESTS)
+            content = create_error_response(
+                "Too many requests. Service is at capacity.",
+                "rate_limit_exceeded",
+                HTTPStatus.TOO_MANY_REQUESTS,
+            )
             raise HTTPException(status_code=429, detail=content)
         except Exception as e:
-            logger.error(f"Error in multimodal response generation: {str(e)}")
-            content = create_error_response(f"Failed to generate multimodal response: {str(e)}", "server_error", HTTPStatus.INTERNAL_SERVER_ERROR)
+            logger.error(f"Error in multimodal response generation: {e!s}")
+            content = create_error_response(
+                f"Failed to generate multimodal response: {e!s}",
+                "server_error",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
             raise HTTPException(status_code=500, detail=content)
 
     def __del__(self):
         """Cleanup resources on deletion."""
         # Removed async cleanup from __del__; use close() instead
-        pass
 
     async def close(self):
         """Explicitly cleanup resources asynchronously."""
-        if hasattr(self, 'image_processor'):
+        if hasattr(self, "image_processor"):
             await self.image_processor.cleanup()
-        if hasattr(self, 'audio_processor'):
+        if hasattr(self, "audio_processor"):
             await self.audio_processor.cleanup()
-        if hasattr(self, 'video_processor'):
+        if hasattr(self, "video_processor"):
             await self.video_processor.cleanup()
 
     async def cleanup(self) -> None:
@@ -459,23 +680,23 @@ class MLXVLMHandler:
         """
         try:
             logger.info("Cleaning up MLXVLMHandler resources")
-            if hasattr(self, 'inference_worker'):
+            if hasattr(self, "inference_worker"):
                 self.inference_worker.stop()
-            if hasattr(self, 'image_processor'):
+            if hasattr(self, "image_processor"):
                 await self.image_processor.cleanup()
-            if hasattr(self, 'audio_processor'):
+            if hasattr(self, "audio_processor"):
                 await self.audio_processor.cleanup()
-            if hasattr(self, 'video_processor'):
+            if hasattr(self, "video_processor"):
                 await self.video_processor.cleanup()
 
             # Force garbage collection after cleanup
             gc.collect()
             logger.info("MLXVLMHandler cleanup completed successfully")
         except Exception as e:
-            logger.error(f"Error during MLXVLMHandler cleanup: {str(e)}")
+            logger.error(f"Error during MLXVLMHandler cleanup: {e!s}")
             raise
 
-    async def get_queue_stats(self) -> Dict[str, Any]:
+    async def get_queue_stats(self) -> dict[str, Any]:
         """Get statistics from the inference worker.
 
         Returns
@@ -487,31 +708,23 @@ class MLXVLMHandler:
             "queue_stats": self.inference_worker.get_stats(),
         }
 
-    async def _reformat_multimodal_content_part(self, content_part: ChatCompletionContentPart) -> Tuple[Dict[str, Any], bool]:
+    async def _reformat_multimodal_content_part(
+        self, content_part: ChatCompletionContentPart
+    ) -> tuple[dict[str, Any], bool]:
         """
         Reformat a multimodal message content part into a dictionary.
         """
         if isinstance(content_part, ChatCompletionContentPartImage):
             image_url = content_part.image_url.url
-            image_path = await self.image_processor.process_image_url(image_url, resize=not self.disable_auto_resize)
-            return {
-                "content_part": {
-                    "type": "image",
-                    "image": image_path
-                },
-                "path": image_path
-            }
+            image_path = await self.image_processor.process_image_url(
+                image_url, resize=not self.disable_auto_resize
+            )
+            return {"content_part": {"type": "image", "image": image_path}, "path": image_path}
 
         if isinstance(content_part, ChatCompletionContentPartInputAudio):
             audio_url = content_part.input_audio.data
             audio_path = await self.audio_processor.process_audio_url(audio_url)
-            return {
-                "content_part": {
-                    "type": "audio",
-                    "audio": audio_path
-                },
-                "path": audio_path
-            }
+            return {"content_part": {"type": "audio", "audio": audio_path}, "path": audio_path}
 
         if isinstance(content_part, ChatCompletionContentPartVideo):
             video_url = content_part.video_url.url
@@ -521,29 +734,26 @@ class MLXVLMHandler:
                     "type": "video",
                     "video": video_path,
                 },
-                "path": video_path
+                "path": video_path,
             }
 
-        return {
-            "content_part": {
-                "type": "text",
-                "text": content_part.text
-            }
-        }
+        return {"content_part": {"type": "text", "text": content_part.text}}
 
-    async def _prepare_multimodal_request(self, request: ChatCompletionRequest) -> Tuple[List[Dict[str, Any]], List[str], List[str], Dict[str, Any]]:
+    async def _prepare_multimodal_request(
+        self, request: ChatCompletionRequest
+    ) -> tuple[list[dict[str, Any]], list[str], list[str], dict[str, Any]]:
         """
         Prepare the multimodal request by processing messages with text, images, and audio.
-        
+
         This method:
         1. Extracts text messages, image URLs, and audio data from the request
         2. Processes image URLs and audio data to get local file paths
         3. Prepares model parameters
         4. Returns processed data ready for model inference
-        
+
         Args:
             request (ChatCompletionRequest): The incoming request containing messages and parameters.
-            
+
         Returns:
             Tuple[List[Dict[str, Any]], List[str], List[str], Dict[str, Any]]: A tuple containing:
                 - List of processed chat messages
@@ -552,30 +762,54 @@ class MLXVLMHandler:
                 - List of processed video paths
                 - Dictionary of model parameters
         """
-        chat_messages = []
+        non_system_messages: list[dict[str, Any]] = []
+        system_messages: list[str] = []
         images = []
         audios = []
         videos = []
 
         for message in request.messages:
-            # Handle system and assistant messages (simple text content)
-            if message.role in ["system", "assistant"]:
-                chat_messages.append({"role": message.role, "content": message.content})
+            # Collect system messages separately for consolidation
+            if message.role == "system":
+                content = message.content
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, str):
+                            text_parts.append(item)
+                        elif (
+                            isinstance(item, dict)
+                            and item.get("type") == "text"
+                            and item.get("text")
+                        ):
+                            text_parts.append(item["text"])
+                        elif hasattr(item, "text") and item.text:
+                            text_parts.append(item.text)
+                    content = "\n".join(text_parts) if text_parts else ""
+                if content:
+                    system_messages.append(content)
+                continue
+
+            # Handle assistant messages (simple text content)
+            if message.role == "assistant":
+                non_system_messages.append({"role": message.role, "content": message.content})
                 continue
 
             # Handle user messages
             if message.role == "user":
                 # Case 1: Simple string content
                 if isinstance(message.content, str):
-                    chat_messages.append({"role": "user", "content": message.content})
+                    non_system_messages.append({"role": "user", "content": message.content})
                     continue
-                    
+
                 # Case 2: Content is a list of dictionaries or objects
                 if isinstance(message.content, list):
                     formatted_content_parts = []
 
                     for content_part in message.content:
-                        formatted_content_part = await self._reformat_multimodal_content_part(content_part)
+                        formatted_content_part = await self._reformat_multimodal_content_part(
+                            content_part
+                        )
                         if isinstance(content_part, ChatCompletionContentPartImage):
                             images.append(formatted_content_part["path"])
                         elif isinstance(content_part, ChatCompletionContentPartInputAudio):
@@ -584,10 +818,24 @@ class MLXVLMHandler:
                             videos.append(formatted_content_part["path"])
 
                         formatted_content_parts.append(formatted_content_part["content_part"])
-                    chat_messages.append({"role": "user", "content": formatted_content_parts})
+                    non_system_messages.append({"role": "user", "content": formatted_content_parts})
                 else:
-                    content = create_error_response("Invalid message content format", "invalid_request_error", HTTPStatus.BAD_REQUEST)
+                    content = create_error_response(
+                        "Invalid message content format",
+                        "invalid_request_error",
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     raise HTTPException(status_code=400, detail=content)
+
+            # Handle tool messages and other roles
+            else:
+                non_system_messages.append({"role": message.role, "content": message.content})
+
+        # Consolidate system messages into a single string at index 0
+        chat_messages: list[dict[str, Any]] = []
+        if system_messages:
+            chat_messages.append({"role": "system", "content": "\n\n".join(system_messages)})
+        chat_messages.extend(non_system_messages)
 
         request_dict = request.model_dump()
         request_dict.pop("messages")
@@ -605,25 +853,27 @@ class MLXVLMHandler:
             chat_template_kwargs["tools"] = tools
             if tool_choice:
                 chat_template_kwargs["tool_choice"] = tool_choice
-        
+
         request_dict["chat_template_kwargs"] = chat_template_kwargs
-        
+
         return request_dict
-            
+
     def _validate_image_url(self, url: str) -> None:
         """
         Validate image URL format.
-        
+
         Args:
             url: The image URL to validate
-            
+
         Raises:
             HTTPException: If URL is invalid
         """
         if not url:
-            content = create_error_response("Empty image URL provided", "invalid_request_error", HTTPStatus.BAD_REQUEST)
+            content = create_error_response(
+                "Empty image URL provided", "invalid_request_error", HTTPStatus.BAD_REQUEST
+            )
             raise HTTPException(status_code=400, detail=content)
-            
+
         # Validate base64 images
         if url.startswith("data:"):
             try:
@@ -632,23 +882,27 @@ class MLXVLMHandler:
                     raise ValueError("Invalid image format")
                 base64.b64decode(encoded)
             except Exception as e:
-                content = create_error_response(f"Invalid base64 image: {str(e)}", "invalid_request_error", HTTPStatus.BAD_REQUEST)
+                content = create_error_response(
+                    f"Invalid base64 image: {e!s}", "invalid_request_error", HTTPStatus.BAD_REQUEST
+                )
                 raise HTTPException(status_code=400, detail=content)
-                
+
     def _validate_audio_data(self, url: str) -> None:
         """
         Validate audio data URL format.
-        
+
         Args:
             url: The audio data URL to validate
-            
+
         Raises:
             HTTPException: If audio data is invalid
         """
         if not url:
-            content = create_error_response("Empty audio data provided", "invalid_request_error", HTTPStatus.BAD_REQUEST)
+            content = create_error_response(
+                "Empty audio data provided", "invalid_request_error", HTTPStatus.BAD_REQUEST
+            )
             raise HTTPException(status_code=400, detail=content)
-            
+
         # Validate base64 audio
         if url.startswith("data:"):
             try:
@@ -657,5 +911,7 @@ class MLXVLMHandler:
                     raise ValueError("Invalid audio format")
                 base64.b64decode(encoded)
             except Exception as e:
-                content = create_error_response(f"Invalid base64 audio: {str(e)}", "invalid_request_error", HTTPStatus.BAD_REQUEST)
+                content = create_error_response(
+                    f"Invalid base64 audio: {e!s}", "invalid_request_error", HTTPStatus.BAD_REQUEST
+                )
                 raise HTTPException(status_code=400, detail=content)

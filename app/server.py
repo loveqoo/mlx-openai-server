@@ -17,17 +17,17 @@ Key exports:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import gc
 import time
-from contextlib import asynccontextmanager
 from typing import Any
 
-import mlx.core as mx
-import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
+import mlx.core as mx
+import uvicorn
 
 from .api.endpoints import router
 from .config import MLXServerConfig, ModelEntryConfig, MultiModelServerConfig
@@ -39,6 +39,23 @@ from .handler.mlx_lm import MLXLMHandler
 from .handler.mlx_vlm import MLXVLMHandler
 from .handler.mlx_whisper import MLXWhisperHandler
 from .version import __version__
+
+MFLUX_INSTALL_HINT = (
+    "Image generation and editing require the optional `mflux` package. "
+    "Install a compatible build separately, for example "
+    "`pip install git+https://github.com/cubist38/mflux.git`."
+)
+
+
+def ensure_image_handler_available(model_type: str) -> None:
+    """Validate that optional image generation support is installed."""
+    if model_type not in {"image-generation", "image-edit"}:
+        return
+
+    if MLXFluxHandler is not None:
+        return
+
+    raise RuntimeError(MFLUX_INSTALL_HINT)
 
 
 def configure_logging(
@@ -76,7 +93,7 @@ def configure_logging(
         colorize=True,
     )
     if not no_log_file:
-        file_path = log_file if log_file else "logs/app.log"
+        file_path = log_file or "logs/app.log"
         logger.add(
             file_path,
             rotation="500 MB",
@@ -171,10 +188,7 @@ def create_lifespan(config_args: MLXServerConfig):
                     debug=config_args.debug,
                 )
             elif config_args.model_type == "image-generation":
-                if config_args.config_name not in ["flux-schnell", "flux-dev", "flux-krea-dev", "qwen-image", "z-image-turbo", "fibo", "flux2-klein-4b", "flux2-klein-9b"]:
-                    raise ValueError(
-                        f"Invalid config name: {config_args.config_name}. Only flux-schnell, flux-dev, flux-krea-dev, qwen-image, z-image-turbo, fibo, flux2-klein-4b, and flux2-klein-9b are supported for image generation."
-                    )
+                ensure_image_handler_available(config_args.model_type)
                 handler = MLXFluxHandler(
                     model_path=model_identifier,
                     max_concurrency=config_args.max_concurrency,
@@ -188,10 +202,7 @@ def create_lifespan(config_args: MLXServerConfig):
                     model_path=model_identifier, max_concurrency=config_args.max_concurrency
                 )
             elif config_args.model_type == "image-edit":
-                if config_args.config_name not in ["flux-kontext-dev", "qwen-image-edit"]:
-                    raise ValueError(
-                        f"Invalid config name: {config_args.config_name}. Only flux-kontext-dev and qwen-image-edit are supported for image edit."
-                    )
+                ensure_image_handler_available(config_args.model_type)
                 handler = MLXFluxHandler(
                     model_path=model_identifier,
                     max_concurrency=config_args.max_concurrency,
@@ -217,6 +228,7 @@ def create_lifespan(config_args: MLXServerConfig):
                     chat_template_file=config_args.chat_template_file,
                     debug=config_args.debug,
                     prompt_cache_size=config_args.prompt_cache_size,
+                    prompt_cache_max_bytes=config_args.prompt_cache_max_bytes,
                     draft_model_path=config_args.draft_model_path,
                     num_draft_tokens=config_args.num_draft_tokens,
                 )
@@ -232,7 +244,7 @@ def create_lifespan(config_args: MLXServerConfig):
             app.state.handler = handler
 
         except Exception as e:
-            logger.error(f"Failed to initialize MLX handler: {str(e)}")
+            logger.error(f"Failed to initialize MLX handler: {e!s}")
             raise
 
         # Initial memory cleanup
@@ -250,7 +262,7 @@ def create_lifespan(config_args: MLXServerConfig):
                 await app.state.handler.cleanup()
                 logger.info("Resources cleaned up successfully")
             except Exception as e:
-                logger.error(f"Error during shutdown: {str(e)}")
+                logger.error(f"Error during shutdown: {e!s}")
 
         # Final memory cleanup
         mx.clear_cache()
@@ -300,17 +312,7 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         )
 
     if model_cfg.model_type == "image-generation":
-        valid_gen_configs = {
-            "flux-schnell", "flux-dev", "flux-krea-dev",
-            "qwen-image", "z-image-turbo", "fibo",
-            "flux2-klein-4b", "flux2-klein-9b",
-        }
-        if model_cfg.config_name not in valid_gen_configs:
-            msg = (
-                f"Invalid config name: {model_cfg.config_name}. "
-                f"Supported for image generation: {sorted(valid_gen_configs)}"
-            )
-            raise ValueError(msg)
+        ensure_image_handler_available(model_cfg.model_type)
         return MLXFluxHandler(
             model_path=model_path,
             max_concurrency=model_cfg.max_concurrency,
@@ -321,13 +323,7 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         )
 
     if model_cfg.model_type == "image-edit":
-        valid_edit_configs = {"flux-kontext-dev", "qwen-image-edit"}
-        if model_cfg.config_name not in valid_edit_configs:
-            msg = (
-                f"Invalid config name: {model_cfg.config_name}. "
-                f"Supported for image edit: {sorted(valid_edit_configs)}"
-            )
-            raise ValueError(msg)
+        ensure_image_handler_available(model_cfg.model_type)
         return MLXFluxHandler(
             model_path=model_path,
             max_concurrency=model_cfg.max_concurrency,
@@ -362,6 +358,7 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         chat_template_file=model_cfg.chat_template_file,
         debug=model_cfg.debug,
         prompt_cache_size=model_cfg.prompt_cache_size,
+        prompt_cache_max_bytes=model_cfg.prompt_cache_max_bytes,
         draft_model_path=model_cfg.draft_model_path,
         num_draft_tokens=model_cfg.num_draft_tokens,
         default_temperature=model_cfg.default_temperature,
@@ -447,9 +444,7 @@ def create_multi_lifespan(config: MultiModelServerConfig):
                     model_type=model_cfg.model_type,
                     context_length=model_cfg.context_length,
                 )
-                logger.info(
-                    f"Model '{model_id}' spawned and registered successfully"
-                )
+                logger.info(f"Model '{model_id}' spawned and registered successfully")
 
             # Store registry on app state for endpoint access
             app.state.registry = registry
@@ -590,7 +585,7 @@ def setup_server(config_args: MLXServerConfig | MultiModelServerConfig) -> uvico
         response with a 500 status code so internal errors do not leak
         implementation details to clients.
         """
-        logger.error(f"Global exception handler caught: {str(exc)}", exc_info=True)
+        logger.error(f"Global exception handler caught: {exc!s}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={"error": {"message": "Internal server error", "type": "internal_error"}},

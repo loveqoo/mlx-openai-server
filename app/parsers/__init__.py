@@ -1,3 +1,5 @@
+"""Parser registry and factory helpers for reasoning/tool extraction."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,43 +16,48 @@ from .functiongemma import FunctionGemmaToolParser
 from .glm4_moe import GLM4MoEReasoningParser, GLM4MoEToolParser
 from .harmony import HarmonyParser
 from .hermes import HermesReasoningParser, HermesToolParser
+from .kimi_k2 import KimiK2ToolParser
+from .longcat_flash_lite import LongCatFlashLiteToolParser
 from .minimax_m2 import MiniMaxM2ToolParser
+from .mixed_think_tool_handoff import MixedThinkToolHandoffReasoningParser, Step35ReasoningParser
+from .qwen3 import Qwen3ReasoningParser
+from .qwen3_5 import Qwen35ReasoningParser
 from .qwen3_moe import Qwen3MoEReasoningParser
 from .solar_open import SolarOpenReasoningParser, SolarOpenToolParser
-from .longcat_flash_lite import LongCatFlashLiteToolParser
-from .kimi_k2 import KimiK2ToolParser
 
 # Mapping from parser name strings to reasoning parser classes
 REASONING_PARSER_MAP: dict[str, type[AbstractReasoningParser]] = {
     "hermes": HermesReasoningParser,
-    "qwen3": HermesReasoningParser, # use HermesReasoningParser for Qwen3
+    "qwen3": Qwen3ReasoningParser,
     "qwen3_moe": Qwen3MoEReasoningParser,
-    "qwen3_vl": Qwen3MoEReasoningParser, # use Qwen3MoEReasoningParser for Qwen3 VL
+    "qwen3_vl": Qwen3MoEReasoningParser,  # use Qwen3MoEReasoningParser for Qwen3 VL
+    "qwen3_5": Qwen35ReasoningParser,
     "glm4_moe": GLM4MoEReasoningParser,
-    "glm47_flash": Qwen3MoEReasoningParser, # use Qwen3MoEReasoningParser for GLM47 Flash
-    "minimax_m2": Qwen3MoEReasoningParser, # use Qwen3MoEReasoningParser for MiniMax M2
-    "nemotron3_nano": Qwen3MoEReasoningParser, # use Qwen3MoEReasoningParser for Nemotron3 Nano
-    "solar_open": SolarOpenReasoningParser, 
+    "glm47_flash": Qwen3MoEReasoningParser,  # use Qwen3MoEReasoningParser for GLM47 Flash
+    "minimax_m2": Qwen3MoEReasoningParser,  # use Qwen3MoEReasoningParser for MiniMax M2
+    "nemotron3_nano": Qwen3MoEReasoningParser,  # use Qwen3MoEReasoningParser for Nemotron3 Nano
+    "solar_open": SolarOpenReasoningParser,
     "kimi_k2": HermesReasoningParser,
-    "step_35": Qwen3MoEReasoningParser, # use Qwen3MoEReasoningParser for Step 35
+    "mixed_think_tool_handoff": MixedThinkToolHandoffReasoningParser,
+    "step_35": Step35ReasoningParser,  # backward-compatible parser with legacy implicit-open behavior
 }
 
 # Mapping from parser name strings to tool parser classes
 TOOL_PARSER_MAP: dict[str, type[AbstractToolParser]] = {
     "hermes": HermesToolParser,
-    "qwen3": HermesToolParser, # use HermesToolParser for Qwen3
-    "qwen3_coder": FunctionParameterToolParser, # use FunctionParameterToolParser for Qwen3 Coder
-    "qwen3_moe": HermesToolParser, # use HermesToolParser for Qwen3 MoE
-    "qwen3_vl": HermesToolParser, # use HermesToolParser for Qwen3 VL
+    "qwen3": HermesToolParser,  # use HermesToolParser for Qwen3
+    "qwen3_coder": FunctionParameterToolParser,  # use FunctionParameterToolParser for Qwen3 Coder
+    "qwen3_moe": HermesToolParser,  # use HermesToolParser for Qwen3 MoE
+    "qwen3_vl": HermesToolParser,  # use HermesToolParser for Qwen3 VL
     "glm4_moe": GLM4MoEToolParser,
     "minimax_m2": MiniMaxM2ToolParser,
-    "nemotron3_nano": FunctionParameterToolParser, # use FunctionParameterToolParser for Nemotron3 Nano
+    "nemotron3_nano": FunctionParameterToolParser,  # use FunctionParameterToolParser for Nemotron3 Nano
     "functiongemma": FunctionGemmaToolParser,
-    "iquest_coder_v1": HermesToolParser, # use HermesToolParser for IQuest Coder V1
+    "iquest_coder_v1": HermesToolParser,  # use HermesToolParser for IQuest Coder V1
     "solar_open": SolarOpenToolParser,
     "longcat_flash_lite": LongCatFlashLiteToolParser,
     "kimi_k2": KimiK2ToolParser,
-    "step_35": FunctionParameterToolParser, # use FunctionParameterToolParser for Step 35
+    "step_35": FunctionParameterToolParser,  # use FunctionParameterToolParser for Step 35
 }
 
 # Unified parsers that handle BOTH reasoning and tool calls in one class
@@ -61,12 +68,12 @@ UNIFIED_PARSER_MAP: dict[str, type] = {
 
 def get_reasoning_parser(parser_name: str | None) -> type[AbstractReasoningParser] | None:
     """Get a reasoning parser class by name.
-    
+
     Parameters
     ----------
     parser_name : str
         Name of the reasoning parser (e.g., 'qwen3', 'hermes', 'glm4-moe').
-        
+
     Returns
     -------
     type[AbstractReasoningParser] | None
@@ -79,12 +86,12 @@ def get_reasoning_parser(parser_name: str | None) -> type[AbstractReasoningParse
 
 def get_tool_parser(parser_name: str | None) -> type[AbstractToolParser] | None:
     """Get a tool parser class by name.
-    
+
     Parameters
     ----------
     parser_name : str
         Name of the tool parser (e.g., 'qwen3', 'hermes', 'functiongemma').
-        
+
     Returns
     -------
     type[AbstractToolParser] | None
@@ -97,12 +104,12 @@ def get_tool_parser(parser_name: str | None) -> type[AbstractToolParser] | None:
 
 def get_unified_parser(parser_name: str | None) -> type | None:
     """Get a unified parser class by name.
-    
+
     Parameters
     ----------
     parser_name : str
         Name of the unified parser (e.g., 'harmony').
-        
+
     Returns
     -------
     type | None
@@ -116,7 +123,7 @@ def get_unified_parser(parser_name: str | None) -> type | None:
 @dataclass
 class ParsersResult:
     """Result container for created parsers.
-    
+
     Attributes
     ----------
     reasoning_parser : AbstractReasoningParser | None
@@ -128,37 +135,38 @@ class ParsersResult:
     parser_name : str | None
         The primary parser name used (for metadata lookups).
     """
+
     reasoning_parser: AbstractReasoningParser | None = None
     tool_parser: AbstractToolParser | None = None
     unified_parser: Any | None = None
     parser_name: str | None = None
-    
+
     @property
     def is_unified(self) -> bool:
         """Check if using a unified parser.
-        
+
         Returns
         -------
         bool
             True if using a unified parser, False otherwise.
         """
         return self.unified_parser is not None
-    
+
     @property
     def has_reasoning(self) -> bool:
         """Check if reasoning parsing is available.
-        
+
         Returns
         -------
         bool
             True if reasoning parsing is available, False otherwise.
         """
         return self.reasoning_parser is not None or self.unified_parser is not None
-    
+
     @property
     def has_tool_parsing(self) -> bool:
         """Check if tool parsing is available.
-        
+
         Returns
         -------
         bool
@@ -170,21 +178,21 @@ class ParsersResult:
 class ParserManager:
     """
     Factory for creating reasoning and tool parsers.
-    
+
     Handles unified parsers (like Harmony) that combine both capabilities,
-    ensuring only one instance is created when both --reasoning-parser 
+    ensuring only one instance is created when both --reasoning-parser
     and --tool-call-parser point to the same unified parser.
-    
+
     Examples
     --------
     >>> result = ParserManager.create_parsers("harmony", "harmony")
     >>> result.is_unified
     True
     >>> result.unified_parser  # Single HarmonyParser instance
-    
+
     >>> result = ParserManager.create_parsers("qwen3", "hermes")
     >>> result.reasoning_parser  # Qwen3ReasoningParser
-    >>> result.tool_parser       # HermesToolParser
+    >>> result.tool_parser  # HermesToolParser
     """
 
     @staticmethod
@@ -194,25 +202,25 @@ class ParserManager:
     ) -> ParsersResult:
         """
         Create parser instances based on configuration.
-        
+
         Parameters
         ----------
         reasoning_parser_name : str | None
             Name of the reasoning parser (e.g., 'qwen3', 'harmony').
         tool_parser_name : str | None
             Name of the tool parser (e.g., 'hermes', 'harmony').
-            
+
         Returns
         -------
         ParsersResult
             Container with created parser instances.
         """
         result = ParsersResult()
-        
+
         # Normalize names
         reasoning_name = reasoning_parser_name.lower() if reasoning_parser_name else None
         tool_name = tool_parser_name.lower() if tool_parser_name else None
-        
+
         # Case 1: Check for unified parser
         unified_name = ParserManager._get_unified_parser_name(reasoning_name, tool_name)
         if unified_name:
@@ -220,19 +228,19 @@ class ParserManager:
             result.unified_parser = parser_class()
             result.parser_name = unified_name
             return result
-        
+
         # Case 2: Create separate parsers
         if reasoning_name and reasoning_name in REASONING_PARSER_MAP:
             result.reasoning_parser = REASONING_PARSER_MAP[reasoning_name]()
             result.parser_name = reasoning_name
-        
+
         if tool_name and tool_name in TOOL_PARSER_MAP:
             result.tool_parser = TOOL_PARSER_MAP[tool_name]()
             if not result.parser_name:
                 result.parser_name = tool_name
-        
+
         return result
-    
+
     @staticmethod
     def _get_unified_parser_name(
         reasoning_name: str | None,
@@ -240,43 +248,46 @@ class ParserManager:
     ) -> str | None:
         """
         Check if configuration should use a unified parser.
-        
+
         Parameters
         ----------
         reasoning_name : str | None
             Normalized reasoning parser name.
         tool_name : str | None
             Normalized tool parser name.
-            
+
         Returns
         -------
         str | None
             Parser name if unified, None otherwise.
         """
         # Both point to same unified parser
-        if (reasoning_name and tool_name and 
-            reasoning_name == tool_name and
-            reasoning_name in UNIFIED_PARSER_MAP):
+        if (
+            reasoning_name
+            and tool_name
+            and reasoning_name == tool_name
+            and reasoning_name in UNIFIED_PARSER_MAP
+        ):
             return reasoning_name
-        
+
         # Either one is a unified parser (takes precedence)
         if reasoning_name and reasoning_name in UNIFIED_PARSER_MAP:
             return reasoning_name
         if tool_name and tool_name in UNIFIED_PARSER_MAP:
             return tool_name
-        
+
         return None
-    
+
     @staticmethod
     def is_unified_parser(parser_name: str | None) -> bool:
         """
         Check if a parser name refers to a unified parser.
-        
+
         Parameters
         ----------
         parser_name : str | None
             Parser name to check.
-            
+
         Returns
         -------
         bool
@@ -297,21 +308,20 @@ __all__ = [
     "HermesReasoningParser",
     "Qwen3ReasoningParser",
     "Qwen3MoEReasoningParser",
-    "Qwen3VLReasoningParser",
+    "Qwen35ReasoningParser",
     "GLM4MoEReasoningParser",
-    "MiniMaxM2ReasoningParser",
-    "Nemotron3NanoReasoningParser",
+    "SolarOpenReasoningParser",
+    "MixedThinkToolHandoffReasoningParser",
+    "Step35ReasoningParser",
     # Tool parsers
     "HermesToolParser",
-    "Qwen3ToolParser",
-    "Qwen3CoderToolParser",
-    "Qwen3MoEToolParser",
-    "Qwen3VLToolParser",
     "GLM4MoEToolParser",
     "MiniMaxM2ToolParser",
-    "Nemotron3NanoToolParser",
     "FunctionGemmaToolParser",
     "FunctionParameterToolParser",
+    "SolarOpenToolParser",
+    "LongCatFlashLiteToolParser",
+    "KimiK2ToolParser",
     # Unified parsers
     "HarmonyParser",
     # Mappings and helper functions

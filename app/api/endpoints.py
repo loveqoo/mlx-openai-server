@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import base64
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 import json
+import os
 import random
 import time
 from typing import Annotated, Any, Literal
@@ -15,40 +15,44 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 import numpy as np
+from openai.types.responses import FunctionTool
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_output_message import ResponseOutputMessage, ResponseOutputText
+from openai.types.responses.response_reasoning_item import Content, ResponseReasoningItem, Summary
 
 from ..handler.mlx_lm import MLXLMHandler
 from ..handler.mlx_vlm import MLXVLMHandler
 from ..schemas.openai import (
+    ChatCompletionChunk,
     ChatCompletionContentPartImage,
     ChatCompletionContentPartText,
-    ChatCompletionChunk,
     ChatCompletionMessageToolCall,
     ChatCompletionRequest,
-    Config,
     ChatCompletionResponse,
     Choice,
     ChoiceDeltaFunctionCall,
     ChoiceDeltaToolCall,
+    Config,
     Delta,
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingResponseData,
     FunctionCall,
-    ImageURL,
     HealthCheckResponse,
     HealthCheckStatus,
     ImageEditRequest,
     ImageEditResponse,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ImageURL,
+    InputTokensDetails,
     Message,
     Model,
     ModelsResponse,
+    OutputTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
     ResponseUsage,
-    InputTokensDetails,
-    OutputTokensDetails,
     StreamingChoice,
     TranscriptionRequest,
     TranscriptionResponse,
@@ -68,6 +72,7 @@ from openai.types.responses.response_reasoning_item import (
     Content,
     ResponseReasoningItem
 )
+from ..utils.debug_logging import log_debug_server_request
 from ..utils.errors import create_error_response
 
 router = APIRouter()
@@ -309,6 +314,8 @@ def refine_chat_completion_request(
         request.top_p = _parse_env_float("DEFAULT_TOP_P")
     if request.top_k is None:
         request.top_k = _parse_env_int("DEFAULT_TOP_K")
+    if request.min_p is None:
+        request.min_p = _parse_env_float("DEFAULT_MIN_P")
     if request.seed is None:
         request.seed = _parse_env_int("DEFAULT_SEED")
     if request.repetition_penalty is None:
@@ -360,6 +367,12 @@ async def chat_completions(
 
     # Get request ID from middleware
     request_id = getattr(raw_request.state, "request_id", None)
+    if getattr(handler, "debug", False):
+        log_debug_server_request(
+            route="/v1/chat/completions",
+            request_payload=request.model_dump(exclude_none=True),
+            request_id=request_id,
+        )
 
     try:
         if handler_type == "multimodal":
@@ -652,8 +665,9 @@ def create_response_chunk(
     if function_call:
         # Validate index exists before accessing
         tool_index = chunk.get("index", 0)
+        tool_call_id = chunk.get("id", get_tool_call_id())
         tool_chunk = ChoiceDeltaToolCall(
-            index=tool_index, type="function", id=get_tool_call_id(), function=function_call
+            index=tool_index, type="function", id=tool_call_id, function=function_call
         )
 
         delta = Delta(content=None, role="assistant", tool_calls=[tool_chunk])  # type: ignore[call-arg]
@@ -689,6 +703,7 @@ async def handle_stream_response(
     created_time = int(time.time())
     finish_reason = "stop"
     tool_call_index = -1
+    tool_call_ids: dict[int, str] = {}
     usage_info = None
 
     try:
@@ -731,6 +746,12 @@ async def handle_stream_response(
                     payload["index"] = tool_call_index
                 elif payload.get("arguments") and "index" not in payload:
                     payload["index"] = tool_call_index
+
+                if payload.get("name") or payload.get("arguments"):
+                    tool_idx = payload.get("index", 0)
+                    if tool_idx not in tool_call_ids:
+                        tool_call_ids[tool_idx] = payload.get("id", get_tool_call_id())
+                    payload["id"] = tool_call_ids[tool_idx]
 
                 response_chunk = create_response_chunk(
                     payload,
@@ -799,7 +820,7 @@ async def process_multimodal_request(
     usage = result.get("usage")
     final_response = format_final_response(response_data, request.model, request_id, usage)
     return JSONResponse(content=final_response.model_dump(exclude_none=True))
-    
+
 
 
 async def process_text_request(
@@ -1003,7 +1024,7 @@ def _convert_responses_content(
                     image_url=ImageURL(url=str(normalized["image_url"])),
                 )
             )
-    return converted if converted else ""
+    return converted or ""
 
 
 def _convert_responses_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None:
@@ -1112,17 +1133,9 @@ def convert_responses_request_to_chat_request(
                 continue
 
             if item_type == "reasoning":
+                # Do not re-inject prior hidden reasoning into prompt history.
+                # Responses reasoning items are output metadata, not dialogue turns.
                 flush_pending_user_parts()
-                reasoning_parts = item.get("content") or item.get("summary") or []
-                reasoning_text = _convert_responses_content("assistant", reasoning_parts)
-                if reasoning_text:
-                    chat_messages.append(
-                        Message(
-                            role="assistant",
-                            content="",
-                            reasoning_content=str(reasoning_text),
-                        )
-                    )
                 continue
 
             role = item.get("role")
@@ -1291,7 +1304,7 @@ def format_final_responses_response(
         status="completed",
         incomplete_details=None,
         instructions=request.instructions,
-        model=request.model,       
+        model=request.model,
         object="response",
         top_p=request.top_p,
         temperature=request.temperature,
@@ -1734,6 +1747,14 @@ async def responses_endpoint(
                 HTTPStatus.BAD_REQUEST,
             ),
             status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    request_id = getattr(raw_request.state, "request_id", None)
+    if getattr(handler, "debug", False):
+        log_debug_server_request(
+            route="/v1/responses",
+            request_payload=request.model_dump(exclude_none=True),
+            request_id=request_id,
         )
 
     try:

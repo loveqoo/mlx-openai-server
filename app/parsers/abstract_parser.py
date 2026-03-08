@@ -1,3 +1,5 @@
+"""Base parser abstractions and shared streaming parser state machines."""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -12,7 +14,7 @@ class ReasoningParserState(Enum):
 
 class AbstractReasoningParser:
     """Abstract reasoning parser class that should not be used directly.
-    
+
     Provided properties and methods should be used in derived classes to parse
     reasoning content from model outputs.
     """
@@ -24,7 +26,7 @@ class AbstractReasoningParser:
         state: ReasoningParserState = ReasoningParserState.NORMAL,
     ) -> None:
         """Initialize the reasoning parser.
-        
+
         Parameters
         ----------
         reasoning_open : str
@@ -41,7 +43,7 @@ class AbstractReasoningParser:
 
     def get_reasoning_open(self) -> str:
         """Get the opening tag for reasoning content.
-        
+
         Returns
         -------
         str
@@ -51,7 +53,7 @@ class AbstractReasoningParser:
 
     def get_reasoning_close(self) -> str:
         """Get the closing tag for reasoning content.
-        
+
         Returns
         -------
         str
@@ -61,7 +63,7 @@ class AbstractReasoningParser:
 
     def needs_redacted_reasoning_prefix(self) -> bool:
         """Check if the reasoning parser needs a redacted reasoning prefix.
-        
+
         Returns
         -------
         bool
@@ -71,7 +73,7 @@ class AbstractReasoningParser:
 
     def has_special_parsing(self) -> bool:
         """Check if the reasoning parser has special parsing logic.
-        
+
         Returns
         -------
         bool
@@ -81,7 +83,7 @@ class AbstractReasoningParser:
 
     def respects_enable_thinking(self) -> bool:
         """Check if the reasoning parser respects the enable_thinking flag.
-        
+
         Returns
         -------
         bool
@@ -91,18 +93,18 @@ class AbstractReasoningParser:
 
     def extract_reasoning(self, model_output: str) -> dict[str, str] | None:
         """Extract reasoning content from complete model output.
-        
+
         Parameters
         ----------
         model_output : str
             Complete model output to parse.
-            
+
         Returns
         -------
         dict[str, str] | None
             Dictionary with 'reasoning' key containing extracted content,
             or None if no reasoning found.
-            
+
         Raises
         ------
         NotImplementedError
@@ -112,23 +114,21 @@ class AbstractReasoningParser:
             "AbstractReasoningParser.extract_reasoning has not been implemented!"
         )
 
-    def extract_reasoning_streaming(
-        self, chunk: str
-    ) -> tuple[dict[str, str] | str | None, bool]:
+    def extract_reasoning_streaming(self, chunk: str) -> tuple[dict[str, str] | str | None, bool]:
         """Extract reasoning content from streaming chunks.
-        
+
         Parameters
         ----------
         chunk : str
             Chunk of model output to process.
-            
+
         Returns
         -------
         tuple[dict[str, str] | str | None, bool]
             Tuple of (extracted_content, is_complete) where:
             - extracted_content: Reasoning dict, passthrough chunk, or None
             - is_complete: True if chunk should be sent, False if buffering
-            
+
         Raises
         ------
         NotImplementedError
@@ -147,9 +147,22 @@ class ToolParserState(Enum):
     FOUND_ARGUMENTS = "found_arguments"
 
 
+def _suffix_prefix_overlap(text: str, marker: str) -> int:
+    """Return longest suffix length of ``text`` matching marker prefix.
+
+    This is used to retain only the potentially incomplete marker tail across
+    chunk boundaries (for example ``<tool_`` followed by ``call>``).
+    """
+    max_overlap = min(len(text), len(marker) - 1)
+    for size in range(max_overlap, 0, -1):
+        if text.endswith(marker[:size]):
+            return size
+    return 0
+
+
 class AbstractToolParser:
     """Abstract tool parser class that should not be used directly.
-    
+
     Provided properties and methods should be used in derived classes to parse
     tool calls from model outputs.
     """
@@ -161,7 +174,7 @@ class AbstractToolParser:
         state: ToolParserState = ToolParserState.NORMAL,
     ) -> None:
         """Initialize the tool parser.
-        
+
         Parameters
         ----------
         tool_open : str
@@ -178,7 +191,7 @@ class AbstractToolParser:
 
     def get_tool_open(self) -> str:
         """Get the opening tag for tool calls.
-        
+
         Returns
         -------
         str
@@ -188,7 +201,7 @@ class AbstractToolParser:
 
     def get_tool_close(self) -> str:
         """Get the closing tag for tool calls.
-        
+
         Returns
         -------
         str
@@ -198,40 +211,36 @@ class AbstractToolParser:
 
     def extract_tool_calls(self, model_output: str) -> dict[str, list] | None:
         """Extract tool calls from complete model output.
-        
+
         Parameters
         ----------
         model_output : str
             Complete model output to parse.
-            
+
         Returns
         -------
         dict[str, list] | None
             Dictionary with 'tool_calls' key containing list of tool calls,
             or None if no tool calls found.
-            
+
         Raises
         ------
         NotImplementedError
             This method must be implemented by derived classes.
         """
-        raise NotImplementedError(
-            "AbstractToolParser.extract_tool_calls has not been implemented!"
-        )
+        raise NotImplementedError("AbstractToolParser.extract_tool_calls has not been implemented!")
 
-    def extract_tool_calls_streaming(
-        self, chunk: str
-    ) -> tuple[dict[str, list] | str | None, bool]:
+    def extract_tool_calls_streaming(self, chunk: str) -> tuple[dict[str, list] | str | None, bool]:
         """Extract tool calls from streaming chunks.
-        
+
         Default implementation that buffers content between tool_open and tool_close
         tags. Subclasses can override this for custom streaming behavior.
-        
+
         Parameters
         ----------
         chunk : str
             Chunk of model output to process.
-            
+
         Returns
         -------
         tuple[dict[str, list] | str | None, bool]
@@ -239,28 +248,93 @@ class AbstractToolParser:
             - extracted_content: Tool calls dict, passthrough chunk, or None
             - is_complete: True if chunk should be sent, False if buffering
         """
-        if self.tool_open in chunk:
-            self.state = ToolParserState.FOUND_PREFIX
+        def _merge_content_payload(
+            payload: dict[str, list] | None,
+            leading_content: str = "",
+            trailing_content: str = "",
+        ) -> dict[str, list | str]:
+            merged: dict[str, list | str] = (
+                dict(payload) if isinstance(payload, dict) else {}
+            )
+            pieces: list[str] = []
+            if leading_content:
+                pieces.append(leading_content)
+            existing_content = merged.get("content")
+            if isinstance(existing_content, str) and existing_content:
+                pieces.append(existing_content)
+            if trailing_content:
+                pieces.append(trailing_content)
+            if pieces:
+                merged["content"] = "".join(pieces)
+            return merged
 
-            if self.tool_close in chunk:
-                self.buffer += chunk
-                result = self.extract_tool_calls(self.buffer)
+        def _extract_parseable_and_tail(buffer_text: str) -> tuple[str, str]:
+            last_close_idx = buffer_text.rfind(self.tool_close)
+            if last_close_idx < 0:
+                return buffer_text, ""
+            close_end_idx = last_close_idx + len(self.tool_close)
+            return buffer_text[:close_end_idx], buffer_text[close_end_idx:]
+
+        def _consume_tail_for_next_chunk(tail_text: str) -> str:
+            if not tail_text:
                 self.buffer = ""
                 self.state = ToolParserState.NORMAL
-                return result, True
+                return ""
+            overlap = _suffix_prefix_overlap(tail_text, self.tool_open)
+            if overlap > 0:
+                passthrough_tail = tail_text[:-overlap]
+                self.buffer = tail_text[-overlap:]
             else:
-                self.buffer += chunk
-                return None, False
-
-        if self.state == ToolParserState.FOUND_PREFIX:
-            if self.tool_close in chunk:
-                self.buffer += chunk
-                result = self.extract_tool_calls(self.buffer)
+                passthrough_tail = tail_text
                 self.buffer = ""
-                self.state = ToolParserState.NORMAL
-                return result, True
-            else:
-                self.buffer += chunk
+            self.state = ToolParserState.NORMAL
+            return passthrough_tail
+
+        if self.state == ToolParserState.NORMAL:
+            combined = self.buffer + chunk
+            open_idx = combined.find(self.tool_open)
+            if open_idx >= 0:
+                self.state = ToolParserState.FOUND_PREFIX
+                passthrough = combined[:open_idx]
+                self.buffer = combined[open_idx:]
+
+                if self.tool_close in self.buffer:
+                    parseable_text, tail_text = _extract_parseable_and_tail(self.buffer)
+                    result = self.extract_tool_calls(parseable_text)
+                    passthrough_tail = _consume_tail_for_next_chunk(tail_text)
+                    merged = _merge_content_payload(
+                        result,
+                        leading_content=passthrough,
+                        trailing_content=passthrough_tail,
+                    )
+                    return merged, True
+
+                if passthrough:
+                    return {"content": passthrough}, False
                 return None, False
 
-        return {"content": chunk}, False
+            overlap = _suffix_prefix_overlap(combined, self.tool_open)
+            if overlap > 0:
+                passthrough = combined[:-overlap]
+                self.buffer = combined[-overlap:]
+            else:
+                passthrough = combined
+                self.buffer = ""
+
+            if passthrough:
+                return {"content": passthrough}, False
+            return None, False
+
+        combined = self.buffer + chunk
+        if self.tool_close in combined:
+            parseable_text, tail_text = _extract_parseable_and_tail(combined)
+            result = self.extract_tool_calls(parseable_text)
+            passthrough_tail = _consume_tail_for_next_chunk(tail_text)
+            merged = _merge_content_payload(
+                result,
+                trailing_content=passthrough_tail,
+            )
+            return merged, True
+
+        self.buffer = combined
+        return None, False

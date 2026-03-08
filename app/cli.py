@@ -20,6 +20,22 @@ from .message_converters import MESSAGE_CONVERTER_MAP
 from .parsers import REASONING_PARSER_MAP, TOOL_PARSER_MAP, UNIFIED_PARSER_MAP
 from .version import __version__
 
+try:
+    from .models.mflux import IMAGE_CONFIG_NAMES
+except ImportError as exc:
+    IMAGE_CONFIG_NAMES: tuple[str, ...] = ()
+    MFLUX_AVAILABLE = False
+    MFLUX_IMPORT_ERROR: ImportError | None = exc
+else:
+    MFLUX_AVAILABLE = True
+    MFLUX_IMPORT_ERROR = None
+
+MFLUX_INSTALL_HINT = (
+    "Image generation and editing require the optional `mflux` package. "
+    "Install a compatible build separately, for example "
+    "`pip install git+https://github.com/cubist38/mflux.git`."
+)
+
 
 class UpperChoice(click.Choice):
     """Case-insensitive choice type that returns uppercase values.
@@ -57,6 +73,32 @@ class UpperChoice(click.Choice):
         )
 
 
+def validate_image_config_name(
+    _ctx: click.Context, _param: click.Parameter, value: str | None
+) -> str | None:
+    """Validate image config names when optional mflux support is installed."""
+    if value is None or not IMAGE_CONFIG_NAMES:
+        return value
+
+    if value not in IMAGE_CONFIG_NAMES:
+        choices = ", ".join(sorted(IMAGE_CONFIG_NAMES))
+        raise click.BadParameter(f"invalid choice: {value!r}. (choose from {choices})")
+
+    return value
+
+
+def ensure_image_support_available(model_types: set[str]) -> None:
+    """Raise a usage error when image features are requested without mflux."""
+    if not any(model_type in {"image-generation", "image-edit"} for model_type in model_types):
+        return
+
+    if MFLUX_AVAILABLE:
+        return
+
+    detail = f" Optional import failed: {MFLUX_IMPORT_ERROR!s}" if MFLUX_IMPORT_ERROR else ""
+    raise click.UsageError(f"{MFLUX_INSTALL_HINT}{detail}")
+
+
 # Configure basic logging for CLI (will be overridden by main.py)
 logger.remove()  # Remove default handler
 logger.add(
@@ -85,7 +127,6 @@ def cli():
     Subcommands (such as ``launch``) are registered on this group and
     invoked by the console entry point.
     """
-    pass
 
 
 @cli.command()
@@ -133,7 +174,9 @@ def cli():
 @click.option(
     "--config-name",
     default=None,
-    type=click.Choice(["flux-schnell", "flux-dev", "flux-krea-dev", "flux-kontext-dev", "qwen-image", "qwen-image-edit", "z-image-turbo", "fibo", "flux2-klein-4b", "flux2-klein-9b", "flux2-klein-edit-4b", "flux2-klein-edit-9b"]),
+    type=str,
+    callback=validate_image_config_name,
+    metavar="CONFIG_NAME",
     help="Config name of the model. Only used for image-generation and image-edit models.",
 )
 @click.option(
@@ -191,7 +234,8 @@ def cli():
     "--message-converter",
     default=None,
     type=click.Choice(sorted(MESSAGE_CONVERTER_MAP.keys())),
-    help="Specify message converter to use for preprocessing messages. Only works with language models.",
+    hidden=True,
+    help="Deprecated override for message preprocessing. Message converters are auto-detected from parser selection.",
 )
 @click.option(
     "--trust-remote-code",
@@ -211,9 +255,16 @@ def cli():
 )
 @click.option(
     "--prompt-cache-size",
-    default=10,
+    default=100,
     type=int,
     help="Maximum number of prompt KV cache entries to store. Only works with language models (lm). Default is 10.",
+)
+@click.option(
+    "--max-bytes",
+    "prompt_cache_max_bytes",
+    default=1 << 63,
+    type=int,
+    help="Maximum total bytes retained by prompt KV caches before eviction. Only works with language models (lm).",
 )
 @click.option(
     "--draft-model-path",
@@ -235,7 +286,9 @@ def cli():
     help="Default maximum number of tokens to generate.",
 )
 @click.option("--temperature", default=1.0, type=float, help="Default sampling temperature.")
-@click.option("--top-p", default=1.0, type=float, help="Default nucleus sampling (top-p) probability.")
+@click.option(
+    "--top-p", default=1.0, type=float, help="Default nucleus sampling (top-p) probability."
+)
 @click.option("--top-k", default=20, type=int, help="Default top-k sampling parameter.")
 @click.option("--min-p", default=0.0, type=float, help="Default min-p sampling parameter.")
 @click.option(
@@ -289,6 +342,7 @@ def launch(
     chat_template_file,
     debug,
     prompt_cache_size,
+    prompt_cache_max_bytes,
     draft_model_path,
     num_draft_tokens,
     max_tokens,
@@ -319,6 +373,7 @@ def launch(
             multi_config = load_config_from_yaml(config_file)
         except (FileNotFoundError, ValueError) as e:
             raise click.BadParameter(str(e), param_hint="'--config'") from e
+        ensure_image_support_available({model.model_type for model in multi_config.models})
         asyncio.run(start_multi(multi_config))
         return
 
@@ -327,6 +382,8 @@ def launch(
         raise click.UsageError(
             "Either --config (multi-handler YAML) or --model-path (single model) is required."
         )
+
+    ensure_image_support_available({model_type})
 
     args = MLXServerConfig(
         model_path=model_path,
@@ -353,6 +410,7 @@ def launch(
         chat_template_file=chat_template_file,
         debug=debug,
         prompt_cache_size=prompt_cache_size,
+        prompt_cache_max_bytes=prompt_cache_max_bytes,
         draft_model_path=draft_model_path,
         num_draft_tokens=num_draft_tokens,
         default_max_tokens=max_tokens,
