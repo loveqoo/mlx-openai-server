@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import gc
 from http import HTTPStatus
@@ -582,6 +583,17 @@ class MLXLMHandler:
             non_system_messages = []
             
             for message in request_dict.pop("messages", []):
+                # Convert tool_call arguments from JSON string to dict
+                # (OpenAI API spec: string, HuggingFace chat template: dict)
+                for tc in message.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
                 # Handle content that might be a list of dictionaries (multimodal format)
                 content = message.get("content")
                 if content is None:
